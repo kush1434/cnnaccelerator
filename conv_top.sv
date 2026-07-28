@@ -1,22 +1,22 @@
-// ============================================================================
-// conv_top.sv  -- OWNER: Toprak
-// Top level: counters, control FSM, load port, and the three sub-units.
-//
-// Adapted from Part 1 matmul_top. The loop nest is unchanged in structure:
-//   i = patch  (was: row of A)      0..35
-//   j = filter (was: col of B)      0..3
-//   k = tap    (was: shared dim)    0..8
-// A convolution is the same GEMM with a different row-addressing function.
-// ============================================================================
+
+
+
+
+
+
+
+
+
+
 import cnn_pkg::*;
 module conv_top (
   input  logic                     clk,
-  input  logic                     rst_n,     // active LOW, synchronous
-  input  logic                     start,     // 1-cycle pulse
+  input  logic                     rst_n,
+  input  logic                     start,
   output logic                     busy,
-  output logic                     done,      // 1-cycle pulse
+  output logic                     done,
   input  logic                     ld_en,
-  input  logic                     ld_sel_ab, // 0 = image, 1 = weights
+  input  logic                     ld_sel_ab,
   input  logic [LD_ADDR_W-1:0]     ld_addr,
   input  logic signed [DW-1:0]     ld_data,
   input  logic                     rd_en,
@@ -26,14 +26,14 @@ module conv_top (
 
   localparam int COUNT_W = $clog2(C_DEPTH + 1);
 
-  // ---- controller state ---------------------------------------------------
+
   logic                  idle, inputs_done;
   logic [PATCH_W-1:0]    i;
   logic [FILTER_W-1:0]   j;
   logic [TAP_W-1:0]      k;
   logic [COUNT_W-1:0]    final_count;
 
-  // ---- datapath -----------------------------------------------------------
+
   logic                    valid_in, clear_acc;
   logic signed [DW-1:0]    a_data;
   logic signed [ACC_W-1:0] acc_out;
@@ -45,9 +45,9 @@ module conv_top (
   assign filter_ld_en = ld_en &&  ld_sel_ab && idle;
 
   assign valid_in  = !idle && !inputs_done;
-  assign clear_acc = valid_in && (k == 0);    // first tap of each dot product
+  assign clear_acc = valid_in && (k == 0);
 
-  // ---- sub-units ----------------------------------------------------------
+
   input_unit u_input (
     .clk(clk), .ld_en(image_ld_en), .ld_addr(ld_addr), .ld_data(ld_data),
     .i(i), .k(k), .a_data(a_data)
@@ -68,13 +68,13 @@ module conv_top (
     .final_write(final_write)
   );
 
-  // ---- controller ---------------------------------------------------------
+
   always_ff @(posedge clk) begin
     if (!rst_n) begin
       idle <= 1'b1; inputs_done <= 1'b0; done <= 1'b0;
       i <= '0; j <= '0; k <= '0; final_count <= '0;
     end else begin
-      done <= 1'b0;                            // normally low
+      done <= 1'b0;
 
       if (start && idle) begin
         idle <= 1'b0; inputs_done <= 1'b0;
@@ -91,7 +91,7 @@ module conv_top (
         end else k <= k + 1'b1;
       end
 
-      // count completed results; one pulse per element, not per term
+
       if (!idle && final_write) begin
         if (final_count == C_DEPTH-1) begin
           final_count <= '0;

@@ -1,7 +1,7 @@
-// ============================================================================
-// mem.sv -- simple register-array memory. 1 write port, 1 combinational read.
-// Unchanged from Part 1.
-// ============================================================================
+
+
+
+
 module mem #(
   parameter int DW    = 8,
   parameter int DEPTH = 64

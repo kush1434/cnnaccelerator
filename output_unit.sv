@@ -1,27 +1,27 @@
-// ============================================================================
-// output_unit.sv  -- OWNER: Kush
-// Stores completed results, and keeps each result matched to its address.
-//
-// WHY THE PIPELINE: mac_unit takes LAT cycles. By the time a result emerges,
-// the counters i/j/k have already advanced. Writing to memC[i*P+j] with the
-// CURRENT i and j would put the answer in the wrong slot, so the destination
-// address and the last-tap marker are delayed by exactly LAT cycles to travel
-// alongside the data through the MAC.
-// ============================================================================
+
+
+
+
+
+
+
+
+
+
 import cnn_pkg::*;
 module output_unit (
   input  logic                     clk,
-  input  logic                     rst_n,     // active LOW, synchronous
-  input  logic [PATCH_W-1:0]       i,         // patch  (from top)
-  input  logic [FILTER_W-1:0]      j,         // filter (from top)
-  input  logic [TAP_W-1:0]         k,         // tap    (from top)
-  input  logic                     valid_in,  // a term is being fed
-  input  logic signed [ACC_W-1:0]  acc_out,   // from compute_unit
-  input  logic                     valid_out, // from compute_unit
+  input  logic                     rst_n,
+  input  logic [PATCH_W-1:0]       i,
+  input  logic [FILTER_W-1:0]      j,
+  input  logic [TAP_W-1:0]         k,
+  input  logic                     valid_in,
+  input  logic signed [ACC_W-1:0]  acc_out,
+  input  logic                     valid_out,
   input  logic                     rd_en,
   input  logic [C_ADDR_W-1:0]      rd_addr,
   output logic signed [ACC_W-1:0]  rd_data,
-  output logic                     final_write // one pulse per completed result
+  output logic                     final_write
 );
 
   logic [C_ADDR_W-1:0]  c_addr_now;
@@ -34,8 +34,8 @@ module output_unit (
   assign c_addr_now     = i * P + j;
   assign final_term_now = valid_in && (k == N_TAP-1);
 
-  // delay both by LAT, built from the parameter so a different MAC latency
-  // only requires changing cnn_pkg.sv
+
+
   always_ff @(posedge clk) begin
     if (!rst_n) begin
       for (s = 0; s < LAT; s = s + 1) begin
@@ -52,7 +52,7 @@ module output_unit (
     end
   end
 
-  // write once per completed element, not once per term (9x less write activity)
+
   assign final_write = valid_out && final_term_d[LAT-1];
 
   mem #(.DW(ACC_W), .DEPTH(C_DEPTH)) memC (
