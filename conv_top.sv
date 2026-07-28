@@ -1,257 +1,106 @@
-module conv_top #(
-    // Main configuration
-    parameter int IMAGE_HEIGHT = 5,
-    parameter int IMAGE_WIDTH  = 5,
-    parameter int FILTER_SIZE  = 3,
-    parameter int DW           = 8,
-    parameter int ACC_W        = 32,
-
-    // Derived dimensions
-    parameter int IMAGE_DEPTH =
-        IMAGE_HEIGHT * IMAGE_WIDTH,
-
-    parameter int FILTER_DEPTH =
-        FILTER_SIZE * FILTER_SIZE,
-
-    parameter int OUTPUT_HEIGHT =
-        IMAGE_HEIGHT - FILTER_SIZE + 1,
-
-    parameter int OUTPUT_WIDTH =
-        IMAGE_WIDTH - FILTER_SIZE + 1,
-
-    parameter int OUTPUT_DEPTH =
-        OUTPUT_HEIGHT * OUTPUT_WIDTH,
-
-    // Address widths
-    parameter int LOAD_ADDR_W =
-        (IMAGE_DEPTH <= 1) ? 1 : $clog2(IMAGE_DEPTH),
-
-    parameter int OUTPUT_ADDR_W =
-        (OUTPUT_DEPTH <= 1) ? 1 : $clog2(OUTPUT_DEPTH)
-)(
-    input  logic clk,
-    input  logic rst,
-
-    input  logic start,
-    output logic busy,
-    output logic done,
-
-    // Load image or filter
-    input  logic                     ld_en,
-    input  logic                     ld_sel_ab,
-    input  logic [LOAD_ADDR_W-1:0]   ld_addr,
-    input  logic signed [DW-1:0]     ld_data,
-
-    // Read convolution output
-    input  logic                     rd_en,
-    input  logic [OUTPUT_ADDR_W-1:0] rd_addr,
-    output logic signed [ACC_W-1:0]  rd_data
+// ============================================================================
+// conv_top.sv  -- OWNER: Toprak
+// Top level: counters, control FSM, load port, and the three sub-units.
+//
+// Adapted from Part 1 matmul_top. The loop nest is unchanged in structure:
+//   i = patch  (was: row of A)      0..35
+//   j = filter (was: col of B)      0..3
+//   k = tap    (was: shared dim)    0..8
+// A convolution is the same GEMM with a different row-addressing function.
+// ============================================================================
+import cnn_pkg::*;
+module conv_top (
+  input  logic                     clk,
+  input  logic                     rst_n,     // active LOW, synchronous
+  input  logic                     start,     // 1-cycle pulse
+  output logic                     busy,
+  output logic                     done,      // 1-cycle pulse
+  input  logic                     ld_en,
+  input  logic                     ld_sel_ab, // 0 = image, 1 = weights
+  input  logic [LD_ADDR_W-1:0]     ld_addr,
+  input  logic signed [DW-1:0]     ld_data,
+  input  logic                     rd_en,
+  input  logic [C_ADDR_W-1:0]      rd_addr,
+  output logic signed [ACC_W-1:0]  rd_data
 );
 
-    localparam int FILTER_ADDR_W =
-        (FILTER_DEPTH <= 1) ? 1 : $clog2(FILTER_DEPTH);
+  localparam int COUNT_W = $clog2(C_DEPTH + 1);
 
-    //--------------------------------------------------
-    // Controller state
+  // ---- controller state ---------------------------------------------------
+  logic                  idle, inputs_done;
+  logic [PATCH_W-1:0]    i;
+  logic [FILTER_W-1:0]   j;
+  logic [TAP_W-1:0]      k;
+  logic [COUNT_W-1:0]    final_count;
 
-    logic idle;
-    logic inputs_done;
+  // ---- datapath -----------------------------------------------------------
+  logic                    valid_in, clear_acc;
+  logic signed [DW-1:0]    a_data;
+  logic signed [ACC_W-1:0] acc_out;
+  logic                    valid_out, final_write;
+  logic                    image_ld_en, filter_ld_en;
 
-    logic [OUTPUT_ADDR_W-1:0] i;
-    logic [FILTER_ADDR_W-1:0] k;
+  assign busy         = !idle;
+  assign image_ld_en  = ld_en && !ld_sel_ab && idle;
+  assign filter_ld_en = ld_en &&  ld_sel_ab && idle;
 
-    //--------------------------------------------------
-    // Loading controls
+  assign valid_in  = !idle && !inputs_done;
+  assign clear_acc = valid_in && (k == 0);    // first tap of each dot product
 
-    logic image_ld_en;
-    logic filter_ld_en;
+  // ---- sub-units ----------------------------------------------------------
+  input_unit u_input (
+    .clk(clk), .ld_en(image_ld_en), .ld_addr(ld_addr), .ld_data(ld_data),
+    .i(i), .k(k), .a_data(a_data)
+  );
 
-    //--------------------------------------------------
-    // Datapath controls
+  compute_unit u_compute (
+    .clk(clk), .rst_n(rst_n),
+    .ld_en(filter_ld_en), .ld_addr(ld_addr), .ld_data(ld_data),
+    .k(k), .j(j), .valid_in(valid_in), .clear_acc(clear_acc),
+    .a_data(a_data), .acc_out(acc_out), .valid_out(valid_out)
+  );
 
-    logic valid_in;
-    logic clear_acc;
-    logic last_tap;
+  output_unit u_output (
+    .clk(clk), .rst_n(rst_n),
+    .i(i), .j(j), .k(k), .valid_in(valid_in),
+    .acc_out(acc_out), .valid_out(valid_out),
+    .rd_en(rd_en), .rd_addr(rd_addr), .rd_data(rd_data),
+    .final_write(final_write)
+  );
 
-    //--------------------------------------------------
-    // Datapath signals
+  // ---- controller ---------------------------------------------------------
+  always_ff @(posedge clk) begin
+    if (!rst_n) begin
+      idle <= 1'b1; inputs_done <= 1'b0; done <= 1'b0;
+      i <= '0; j <= '0; k <= '0; final_count <= '0;
+    end else begin
+      done <= 1'b0;                            // normally low
 
-    logic signed [DW-1:0]    a_data;
-    logic signed [ACC_W-1:0] acc_out;
-    logic                    valid_out;
+      if (start && idle) begin
+        idle <= 1'b0; inputs_done <= 1'b0;
+        i <= '0; j <= '0; k <= '0; final_count <= '0;
+      end
+      else if (!idle && !inputs_done) begin
+        if (k == N_TAP-1) begin
+          k <= '0;
+          if (j == P-1) begin
+            j <= '0;
+            if (i == N_PATCH-1) inputs_done <= 1'b1;
+            else                i <= i + 1'b1;
+          end else j <= j + 1'b1;
+        end else k <= k + 1'b1;
+      end
 
-    //--------------------------------------------------
-    // Output controls
-
-    logic [OUTPUT_ADDR_W-1:0] output_waddr;
-
-    //--------------------------------------------------
-    // Basic control assignments
-
-    assign busy = !idle;
-
-    // ld_sel_ab:
-    // 0 = image
-    // 1 = filter
-    assign image_ld_en  =
-        ld_en && !ld_sel_ab && idle;
-
-    assign filter_ld_en =
-        ld_en && ld_sel_ab && idle;
-
-    // Send one image/filter pair during every active tap.
-    assign valid_in =
-        !idle && !inputs_done;
-
-    // Clear the accumulator before the first tap of each patch.
-    assign clear_acc =
-        valid_in && (k == 0);
-
-    // Marks the ninth/last multiplication of the dot product.
-    assign last_tap =
-        valid_in && (k == FILTER_DEPTH - 1);
-
-    //--------------------------------------------------
-    // Input unit
-    //
-    // input_unit owns:
-    //   - memA
-    //   - image loading
-    //   - im2col address calculation
-    //
-    // It outputs one selected image pixel as a_data.
-
-    input_unit input_unit_inst (
-        .clk     (clk),
-
-        .ld_en   (image_ld_en),
-        .ld_addr (ld_addr),
-        .ld_data (ld_data),
-
-        .i       (i),
-        .k       (k),
-
-        .a_data  (a_data)
-    );
-
-    //--------------------------------------------------
-    // Compute unit
-    //
-    // compute_unit owns:
-    //   - filter memory
-    //   - filter loading
-    //   - MAC accumulator
-    //
-    // valid_out must indicate that one complete dot
-    // product/result is ready.
-
-    compute_unit compute_unit_inst (
-        .clk       (clk),
-        .rst       (rst),
-
-        .ld_en     (filter_ld_en),
-        .ld_addr   (ld_addr[FILTER_ADDR_W-1:0]),
-        .ld_data   (ld_data),
-
-        .k         (k),
-        .a_data    (a_data),
-
-        .valid_in  (valid_in),
-        .clear_acc (clear_acc),
-        .last_tap  (last_tap),
-
-        .acc_out   (acc_out),
-        .valid_out (valid_out)
-    );
-
-    //--------------------------------------------------
-    // Output unit
-    //
-    // output_unit owns output memory.
-    // Each valid_out pulse writes one convolution result.
-
-    output_unit output_unit_inst (
-        .clk        (clk),
-        .rst        (rst),
-
-        .write_en   (valid_out),
-        .write_addr (output_waddr),
-        .write_data (acc_out),
-
-        .rd_en      (rd_en),
-        .rd_addr    (rd_addr),
-        .rd_data    (rd_data)
-    );
-
-    //--------------------------------------------------
-    // Controller
-    //
-    // i = output position
-    // k = filter tap within the 3x3 window
-
-    always_ff @(posedge clk) begin
-        if (rst) begin
-            idle         <= 1'b1;
-            inputs_done  <= 1'b0;
-            done         <= 1'b0;
-
-            i            <= '0;
-            k            <= '0;
-            output_waddr <= '0;
-        end
-        else begin
-            // done is normally a one-cycle pulse.
-            done <= 1'b0;
-
-            //--------------------------------------------------
-            // Start a new convolution
-
-            if (start && idle) begin
-                idle         <= 1'b0;
-                inputs_done  <= 1'b0;
-
-                i            <= '0;
-                k            <= '0;
-                output_waddr <= '0;
-            end
-
-            //--------------------------------------------------
-            // Send image/filter values into the compute unit
-
-            else if (!idle && !inputs_done) begin
-                if (k == FILTER_DEPTH - 1) begin
-                    k <= '0;
-
-                    if (i == OUTPUT_DEPTH - 1) begin
-                        // All input terms have entered the
-                        // computation pipeline.
-                        inputs_done <= 1'b1;
-                    end
-                    else begin
-                        i <= i + 1'b1;
-                    end
-                end
-                else begin
-                    k <= k + 1'b1;
-                end
-            end
-
-            //--------------------------------------------------
-            // Count completed dot products
-
-            if (!idle && valid_out) begin
-                if (output_waddr == OUTPUT_DEPTH - 1) begin
-                    // Final result has been stored.
-                    idle         <= 1'b1;
-                    inputs_done  <= 1'b0;
-                    done         <= 1'b1;
-                    output_waddr <= '0;
-                end
-                else begin
-                    output_waddr <= output_waddr + 1'b1;
-                end
-            end
-        end
+      // count completed results; one pulse per element, not per term
+      if (!idle && final_write) begin
+        if (final_count == C_DEPTH-1) begin
+          final_count <= '0;
+          idle        <= 1'b1;
+          inputs_done <= 1'b0;
+          done        <= 1'b1;
+        end else final_count <= final_count + 1'b1;
+      end
     end
+  end
 
 endmodule
