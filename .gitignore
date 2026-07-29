@@ -1,6 +1,0 @@
-# simulation build artifacts
-*.vvp
-*.vcd
-mut_compile.log
-mut_run.log
-*.mutbak
