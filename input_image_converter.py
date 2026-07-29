@@ -1,23 +1,24 @@
 from PIL import Image
 
- #you have to install pillow using the command pip install pillow
-def image_to_matrix(filename):
-    # Open the image and convert it to 8-bit grayscale
-    image = Image.open(filename).convert("L")
 
-    width, height = image.size
+def image_to_mem_a(image_path, output_path="mem_a.hex"):
+    # Mem A holds 64 pixels, so resize to 8 × 8
+    image = Image.open(image_path).convert("L")
+    image = image.resize((8, 8))
+
     pixels = list(image.getdata())
 
-    # Convert the flat pixel list into a 2D matrix
-    matrix = [
-        pixels[row * width:(row + 1) * width]
-        for row in range(height)
-    ]
+    with open(output_path, "w") as file:
+        for pixel in pixels:
+            # Convert unsigned grayscale 0–255 to signed -128–127
+            signed_pixel = pixel - 128
 
-    return matrix
+            # Convert signed value to 8-bit two's-complement hex
+            encoded_pixel = signed_pixel & 0xFF
+
+            file.write(f"{encoded_pixel:02X}\n")
+
+    print(f"Stored {len(pixels)} pixels in {output_path}")
 
 
-matrix = image_to_matrix("image.png")  # Also works with .jpg and .jpeg
-
-for row in matrix:
-    print(row)
+image_to_mem_a("image.png")
