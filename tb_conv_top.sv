@@ -52,6 +52,30 @@
 
 import cnn_pkg::*;
 
+// ============================================================================
+// HIERARCHICAL PROBE PATHS -- the only place in this file that names an
+// instance inside the DUT.
+// ----------------------------------------------------------------------------
+// MUST TRACK conv_top.sv's INSTANCE NAMES.  These names are owned by the design
+// side and have already been renamed once (u_output -> u_output_unit), which
+// broke elaboration in three separate places at once.  Keeping every path here
+// makes the next rename a one-line edit instead of a hunt through 1100 lines.
+//
+// If the testbench stops elaborating with "Unable to bind wire/reg/memory
+// dut.<something>", the fix is almost certainly in this block -- compare
+// against the instance names in conv_top.sv and output_unit.sv.
+//
+//   `TB_OUT_UNIT    the output_unit instance inside conv_top
+//   `TB_RESULT_MEM  the mem instance inside it that holds the C_DEPTH results
+//
+// Checked against both microarchitectures currently in the repo: the 1-MAC
+// build (branch main) and the 4-MAC build (branch final) both name these
+// u_output_unit and memC, so one definition covers both.
+// ============================================================================
+`define TB_DUT         dut
+`define TB_OUT_UNIT    `TB_DUT.u_output_unit
+`define TB_RESULT_MEM  `TB_OUT_UNIT.memC
+
 module tb_conv_top;
 
   // ==========================================================================
@@ -66,9 +90,29 @@ module tb_conv_top;
   localparam integer CLK_P      = 10;
   localparam integer MAX_PRINT  = 5;                       // mismatches printed per test
 
-  // One multiply per cycle, three nested counters.
-  localparam integer RUN_CYCLES = N_PATCH * P * N_TAP;     // 36*4*9 = 1296
-  localparam integer TIMEOUT_C  = RUN_CYCLES * 2 + 256;
+  // Readback latency of conv_top's rd_data port, in clocks.
+  //
+  //   0 = combinational read (rd_data valid in the same cycle as rd_addr)
+  //   1 = registered read    (rd_data valid one cycle later)
+  //
+  // memC uses a registered read so it can map to a block RAM instead of
+  // synthesising as flops plus a C_DEPTH-way mux -- see the note in
+  // output_unit.sv.  Everything below is written against this constant rather
+  // than assuming a value, so flipping it back to 0 is all the testbench needs
+  // if the design side reverts.
+  localparam integer RD_LAT     = 1;
+
+  // NOMINAL_CYCLES is an ORDER-OF-MAGNITUDE BOUND used only to size the
+  // watchdog.  It is deliberately NOT used to time any stimulus.
+  //
+  // The real length of an inference is a property of the microarchitecture, not
+  // of the parameters: the 1-MAC design walks i/j/k for N_PATCH*P*N_TAP cycles
+  // plus window preload and pipeline drain, while the 4-MAC variant unrolls the
+  // j loop and finishes in N_PATCH*N_TAP.  Any test that injects stimulus
+  // partway through a run therefore measures the length first
+  // (see calibrate_run_length / meas_cycles) rather than computing it.
+  localparam integer NOMINAL_CYCLES = N_PATCH * P * N_TAP;
+  localparam integer TIMEOUT_C      = NOMINAL_CYCLES * 4 + 1024;
 
   // Worst-case |accumulator|: N_TAP products of the two most negative INT8s.
   //   N_TAP * 2^(DW-1) * 2^(DW-1) = 9 * 128 * 128 = 147456
@@ -204,6 +248,10 @@ module tb_conv_top;
   integer tests_run, tests_failed, total_errors;
   integer num_seeds, rr_fail, rr_err;
   integer first_cycles, rc_cycles, sb_max_print;
+  // Measured length of one clean inference, established by calibrate_run_length
+  // before any test that needs to act partway through a run.
+  integer meas_cycles, cal_err, t_inject, t_cov0;
+  integer wir_n, wir_target;
   integer drv_timeout;
 
   // per-task loop variables (module level: Icarus does not reliably support
@@ -243,8 +291,8 @@ module tb_conv_top;
   // port rather than output_unit's final_write signal, so a broken we
   // connection cannot hide behind a correct-looking final_write.
   // --------------------------------------------------------------------------
-  wire                 wp_we   = dut.u_output.memC.we;
-  wire [C_ADDR_W-1:0]  wp_addr = dut.u_output.memC.waddr;
+  wire                 wp_we   = `TB_RESULT_MEM.we;
+  wire [C_ADDR_W-1:0]  wp_addr = `TB_RESULT_MEM.waddr;
 
   integer wr_count, wr_while_idle, wp_i, wp_bad;
   integer wr_per_addr [0:C_DEPTH-1];
@@ -369,7 +417,9 @@ module tb_conv_top;
 
   // ==========================================================================
   // 7. Monitor -- sweep the readback port across the whole result memory.
-  //    rd_data is combinational and only valid while rd_en is high.
+  //    rd_data is only valid while rd_en is high, RD_LAT clocks after the
+  //    address is presented.  Holding rd_en and rd_addr stable across the
+  //    latency keeps this correct for RD_LAT = 0 as well as 1.
   // ==========================================================================
   task read_all_results;
     begin
@@ -377,6 +427,7 @@ module tb_conv_top;
         @(negedge clk);
         rd_en   = 1'b1;
         rd_addr = mon_a[C_ADDR_W-1:0];
+        repeat (RD_LAT) @(negedge clk);  // wait out the readback pipeline
         #1;
         got_c[mon_a] = rd_data;          // signed ACC_W -> integer, sign extended
       end
@@ -391,7 +442,7 @@ module tb_conv_top;
   task poison_results;
     begin
       for (pz_i = 0; pz_i < C_DEPTH; pz_i = pz_i + 1)
-        dut.u_output.memC.storage[pz_i] = POISON;
+        `TB_RESULT_MEM.storage[pz_i] = POISON;
     end
   endtask
 
@@ -461,6 +512,86 @@ module tb_conv_top;
         $display("        RUN LENGTH CHANGED: %0d cycles now vs %0d on the first run",
                  rc_cycles, first_cycles);
         nerr = nerr + 1;
+      end
+    end
+  endtask
+
+  // ==========================================================================
+  // 6b. Run-length calibration and mid-run timing helpers
+  // --------------------------------------------------------------------------
+  // Tests that act partway through an inference (T8 injects a start pulse, T9
+  // asserts reset) used to count a fixed N_PATCH*P*N_TAP/2 cycles.  That is a
+  // statement about one microarchitecture, not about the design under test: on
+  // a 4-MAC build that unrolls the j loop the run is a quarter as long, the
+  // injection point lands after done, and the test fails for a reason that has
+  // nothing to do with the RTL.
+  //
+  // Instead: time one clean inference up front, and derive every injection
+  // point from that measurement.  The run length is deterministic (run_and_check
+  // asserts it never changes), so a fraction of the measured value is always
+  // inside the run whatever the architecture.
+  // ==========================================================================
+  task calibrate_run_length;
+    begin
+      $display("\n--- Calibration: measuring one clean inference ---");
+      vec_identity;
+      poison_results;
+      load_memories;
+      golden_model;
+      clear_write_monitor;
+      run_inference(-1, meas_cycles);
+      read_all_results;
+      scoreboard(cal_err);
+      check_write_protocol(t_werr);
+      cal_err = cal_err + t_werr;
+
+      first_cycles = meas_cycles;
+      $display("        measured run length : %0d cycles (start to done)", meas_cycles);
+      $display("        nominal 1-MAC guess : %0d cycles -- NOT used for timing", NOMINAL_CYCLES);
+      $display("        mid-run stimulus is timed off the measured value, so a different");
+      $display("        microarchitecture needs no test edits");
+
+      if (meas_cycles < 4) begin
+        $display("        ERROR: measured run length %0d is too short to inject into", meas_cycles);
+        cal_err = cal_err + 1;
+      end
+      if (cal_err != 0) begin
+        $display("        ERROR: the calibration inference itself reported %0d error(s);", cal_err);
+        $display("               every mid-run injection point below is therefore suspect");
+        total_errors = total_errors + cal_err;
+      end
+    end
+  endtask
+
+  // Fraction of the measured run length, clamped so the injection point can
+  // never sit at or past the end of the run.
+  function integer inject_point(input integer num, input integer den);
+    integer v;
+    begin
+      v = (meas_cycles * num) / den;
+      if (v < 2)                v = 2;
+      if (v > meas_cycles - 2)  v = meas_cycles - 2;
+      inject_point = v;
+    end
+  endfunction
+
+  // Wait until an inference is genuinely underway: busy asserted, then num/den
+  // of the measured run length.  Stops early if the run ends first, so the
+  // caller is left mid-run whenever that is physically possible.  If it is not,
+  // the caller's own busy check reports it -- this helper never papers over a
+  // bad injection point, it just refuses to overshoot silently.
+  task wait_into_run(input integer num, input integer den);
+    begin
+      wir_n = 0;
+      while (busy !== 1'b1 && done !== 1'b1 && wir_n < TIMEOUT_C) begin
+        @(negedge clk);
+        wir_n = wir_n + 1;
+      end
+      wir_target = inject_point(num, den);
+      wir_n = 0;
+      while (wir_n < wir_target && busy === 1'b1 && done !== 1'b1) begin
+        @(negedge clk);
+        wir_n = wir_n + 1;
       end
     end
   endtask
@@ -735,8 +866,14 @@ module tb_conv_top;
       load_memories;
       golden_model;
       clear_write_monitor;
-      // Inject a second start pulse roughly halfway through the run.
-      run_inference(RUN_CYCLES / 2, rc_cycles);
+
+      // Injection point comes from the measured run length, not from a
+      // compile-time cycle count, so this test follows the architecture.
+      t_cov0   = cov[COV_START_BUSY];
+      t_inject = inject_point(1, 2);          // halfway through the measured run
+      $display("        measured run = %0d cycles -> injecting spurious start at cycle %0d",
+               meas_cycles, t_inject);
+      run_inference(t_inject, rc_cycles);
       read_all_results;
       scoreboard(t_err);
       check_write_protocol(t_werr);
@@ -749,10 +886,17 @@ module tb_conv_top;
       end else
         $display("        run length %0d cycles, identical to a clean run", rc_cycles);
 
-      if (cov[COV_START_BUSY] == 0) begin
+      // Precondition guard, kept deliberately.  If the pulse never overlapped
+      // busy then this test proved nothing, and that must be an error rather
+      // than a silent pass -- it is the check that made the hardcoded-timing
+      // bug visible in the first place.
+      if (cov[COV_START_BUSY] <= t_cov0) begin
         $display("        ERROR: the spurious start pulse never actually overlapped busy");
+        $display("               (injected at cycle %0d of a %0d-cycle run -- injection point is wrong)",
+                 t_inject, rc_cycles);
         t_err = t_err + 1;
-      end
+      end else
+        $display("        confirmed: start overlapped busy at cycle %0d and was ignored", t_inject);
 
       finish_test("T8  start while busy is ignored, result unchanged", t_err);
     end
@@ -767,14 +911,23 @@ module tb_conv_top;
       poison_results;
       load_memories;
 
-      // Start a run and kill it partway through.
+      // Start a run and kill it partway through.  The wait is driven by the
+      // measured run length and stops early if the run ends first, so the reset
+      // lands inside the inference whatever the architecture's run length is.
       @(negedge clk); start = 1'b1;
       @(negedge clk); start = 1'b0;
-      repeat (RUN_CYCLES / 3) @(negedge clk);
+      wait_into_run(1, 3);                    // a third of the way in
+
+      // Precondition guard, kept deliberately: if the reset did not actually
+      // land mid-run this test proved nothing and must say so.
       if (busy !== 1'b1) begin
         $display("        ERROR: expected busy high mid-run");
+        $display("               (waited %0d cycles into a %0d-cycle run -- injection point is wrong)",
+                 wir_target, meas_cycles);
         t_err = t_err + 1;
-      end
+      end else
+        $display("        confirmed: reset asserted %0d cycles into a %0d-cycle run, busy still high",
+                 wir_target, meas_cycles);
       rst_n = 1'b0;
       repeat (4) @(negedge clk);
       cov_hit_bin(COV_RST_MID);
@@ -1060,11 +1213,15 @@ module tb_conv_top;
     $display(" IFM %0dx%0d  KS %0d  P %0d  OFM %0dx%0d", IFM_H, IFM_W, KS, P, OFM_H, OFM_W);
     $display(" N_PATCH %0d  N_TAP %0d  DW %0d  ACC_W %0d  LAT %0d", N_PATCH, N_TAP, DW, ACC_W, LAT);
     $display(" A_DEPTH %0d  B_DEPTH %0d  C_DEPTH %0d", A_DEPTH, B_DEPTH, C_DEPTH);
-    $display(" expected run length: %0d multiply cycles + pipeline drain", RUN_CYCLES);
+    $display(" nominal 1-MAC length: %0d cycles (watchdog sizing only; the real", NOMINAL_CYCLES);
+    $display("                       run length is measured, not assumed)");
     $display(" randomized seeds: %0d", num_seeds);
     $display("============================================================");
 
     reset_dut;
+
+    // Must run before any test that acts partway through an inference.
+    calibrate_run_length;
 
     test1_identity;
     test2_single_hot;
