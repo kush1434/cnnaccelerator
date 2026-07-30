@@ -16,81 +16,80 @@ module conv_top
 );
 
   logic [PATCH_W-1:0] i;
-  logic [FILTER_W-1:0] j;
   logic [TAP_W-1:0] k;
-  logic idle, inputs_done, preloading;
+  logic idle, inputs_done;
   logic valid_in, clear_acc;
   logic image_ld_en, weight_ld_en;
+  logic [$clog2(OFM_H)-1:0] out_row;
+  logic [$clog2(OFM_W)-1:0] out_col;
   logic signed [DW-1:0] a_data;
-  logic signed [ACC_W-1:0] acc_out;
+  logic signed [ACC_W-1:0] acc_out0, acc_out1, acc_out2, acc_out3;
   logic valid_out, final_write;
-  logic start_window, window_ready;
   logic [C_ADDR_W-1:0] final_count;
 
-  assign busy = !idle;
-  assign valid_in = !idle && !inputs_done && !preloading;
-  assign clear_acc = valid_in && (k == '0);
-  assign image_ld_en = ld_en && !ld_sel_ab && idle;
+  assign busy         = !idle;
+  assign valid_in     = !idle && !inputs_done;
+  assign clear_acc    = valid_in && (k == '0);
+  assign image_ld_en  = ld_en && !ld_sel_ab && idle;
   assign weight_ld_en = ld_en && ld_sel_ab && idle;
-  assign start_window = start && idle;
+  assign out_row      = i / OFM_W;
+  assign out_col      = i % OFM_W;
 
-  input_unit u_input_unit (
-    .clk(clk), .rst_n(rst_n), .ld_en(image_ld_en), .ld_addr(ld_addr),
-    .ld_data(ld_data), .start_window(start_window), .i(i), .j(j), .k(k),
-    .valid_in(valid_in), .window_ready(window_ready), .a_data(a_data)
+  input_unit_opt u_input_unit (
+    .clk(clk), .ld_en(image_ld_en), .ld_addr(ld_addr), .ld_data(ld_data),
+    .out_row(out_row), .out_col(out_col), .k(k), .a_data(a_data)
   );
 
-  compute_unit u_compute_unit (
-    .clk(clk), .rst_n(rst_n), .ld_en(weight_ld_en), .ld_addr(ld_addr),
-    .ld_data(ld_data), .k(k), .j(j), .valid_in(valid_in),
-    .clear_acc(clear_acc), .a_data(a_data), .acc_out(acc_out),
+  compute_unit_4mac u_compute_unit (
+    .clk(clk), .rst_n(rst_n),
+    .ld_en(weight_ld_en), .ld_addr(ld_addr), .ld_data(ld_data),
+    .k(k), .valid_in(valid_in), .clear_acc(clear_acc), .a_data(a_data),
+    .acc_out0(acc_out0), .acc_out1(acc_out1),
+    .acc_out2(acc_out2), .acc_out3(acc_out3),
     .valid_out(valid_out)
   );
 
   output_unit u_output_unit (
-    .clk(clk), .rst_n(rst_n), .i(i), .j(j), .k(k), .valid_in(valid_in),
-    .acc_out(acc_out), .valid_out(valid_out), .rd_en(rd_en),
-    .rd_addr(rd_addr), .rd_data(rd_data), .final_write(final_write)
+    .clk(clk), .rst_n(rst_n), .i(i), .k(k), .valid_in(valid_in),
+    .acc_out0(acc_out0), .acc_out1(acc_out1),
+    .acc_out2(acc_out2), .acc_out3(acc_out3),
+    .valid_out(valid_out), .rd_en(rd_en), .rd_addr(rd_addr),
+    .rd_data(rd_data), .final_write(final_write)
   );
 
   always_ff @(posedge clk) begin
     if (!rst_n) begin
-      idle <= 1'b1;
-      preloading <= 1'b0;
+      idle        <= 1'b1;
       inputs_done <= 1'b0;
-      done <= 1'b0;
-      i <= '0; j <= '0; k <= '0; final_count <= '0;
+      done        <= 1'b0;
+      i           <= '0;
+      k           <= '0;
+      final_count <= '0;
     end else begin
       done <= 1'b0;
       if (start && idle) begin
-        idle <= 1'b0;
-        preloading <= 1'b1;
+        idle        <= 1'b0;
         inputs_done <= 1'b0;
-        i <= '0; j <= '0; k <= '0; final_count <= '0;
-      end else if (!idle) begin
-        if (preloading) begin
-          if (window_ready) preloading <= 1'b0;
-        end else if (!inputs_done) begin
-          if (k == N_TAP-1) begin
-            k <= '0;
-            if (j == P-1) begin
-              j <= '0;
-              if (i == N_PATCH-1) inputs_done <= 1'b1;
-              else i <= i + 1'b1;
-            end else j <= j + 1'b1;
-          end else k <= k + 1'b1;
-        end
+        i           <= '0;
+        k           <= '0;
+        final_count <= '0;
+      end else if (!idle && !inputs_done) begin
+        if (k == N_TAP-1) begin
+          k <= '0;
+          if (i == N_PATCH-1) inputs_done <= 1'b1;
+          else                  i <= i + 1'b1;
+        end else k <= k + 1'b1;
+      end
 
-        if (final_write) begin
-          if (final_count == C_DEPTH-1) begin
-            final_count <= '0;
-            idle <= 1'b1;
-            preloading <= 1'b0;
-            inputs_done <= 1'b0;
-            done <= 1'b1;
-          end else final_count <= final_count + 1'b1;
-        end
+      if (!idle && final_write) begin
+        if (final_count == C_DEPTH-1) begin
+          final_count <= '0;
+          idle        <= 1'b1;
+          inputs_done <= 1'b0;
+          done        <= 1'b1;
+        end else final_count <= final_count + 1'b1;
       end
     end
   end
+
 endmodule
